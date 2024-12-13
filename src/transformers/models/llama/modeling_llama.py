@@ -50,7 +50,59 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_llama import LlamaConfig
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from torch.nn.attention.flex_attention import _mask_mod_signature
+from torch.nn.attention.flex_attention import (
+    _score_mod_signature,
+    _mask_mod_signature,
+    _vmap_for_bhqkv,
+    _ModificationType,
+)
+from torch.nn.utils.rnn import pad_sequence
+from typing import List, Union
+from torch import Tensor
+import torch
+import random
 
+def causal_mask(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
+
+def _offsets_to_doc_ids_tensor(offsets):
+    device = offsets.device
+    offsets = offsets[offsets != -1]
+    counts = offsets[1:] - offsets[:-1]
+    return torch.repeat_interleave(
+        torch.arange(len(counts), device=device, dtype=torch.int32), counts
+    )
+
+def length_to_offsets(lengths: List[int], device: Union[str, torch.device]) -> Tensor:
+    """Converts a list of lengths to a list of offsets.
+
+    Args:
+        lengths: A list of lengths.
+
+    """
+    offsets = [0]
+    offsets.extend(lengths)
+    offsets = torch.tensor(offsets, device=device, dtype=torch.int32)
+    offsets = torch.cumsum(offsets, dim=-1)
+    return offsets
+
+def generate_doc_mask_mod(offsets):
+    
+    offsets = pad_sequence(offsets, batch_first = True, padding_value = -1)
+    docs = [_offsets_to_doc_ids_tensor(offsets[i]) for i in range(offsets.shape[0])]
+    docs = torch.stack(docs, 0)
+    
+    def document_causal_mask(b, h, q_idx, kv_idx):
+        causal_mask = q_idx >= kv_idx
+        document_mask = docs[b, q_idx] == docs[b, kv_idx]
+        return causal_mask & document_mask
+    
+    return document_causal_mask
+
+flex_attention = torch.compile(flex_attention, dynamic = False)
+create_block_mask = torch.compile(create_block_mask, dynamic = False)
 
 logger = logging.get_logger(__name__)
 
@@ -579,11 +631,85 @@ class LlamaSdpaAttention(LlamaAttention):
 
         return attn_output, None, past_key_value
 
+class LlamaFlexAttention(LlamaAttention):
+
+    # Adapted from LlamaAttention.forward
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
+            logger.warning_once(
+                "LlamaModel is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        # use -1 to infer num_heads and num_key_value_heads as they may vary if tensor parallel is used
+        query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+        if position_embeddings is None:
+            logger.warning_once(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        attn_output = flex_attention(query_states,
+            key_states,
+            value_states, 
+        block_mask=attention_mask)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, -1)
+
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
 
 LLAMA_ATTENTION_CLASSES = {
     "eager": LlamaAttention,
     "flash_attention_2": LlamaFlashAttention2,
     "sdpa": LlamaSdpaAttention,
+    'flex_attention': LlamaFlexAttention,
 }
 
 
@@ -696,6 +822,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn_2 = True
     _supports_sdpa = True
+    _supports_flex_attn = True
     _supports_cache_class = True
     _supports_quantized_cache = True
     _supports_static_cache = True
@@ -880,9 +1007,16 @@ class LlamaModel(LlamaPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
+        if self.config._attn_implementation == 'flex_attention':
+            seq_len = position_ids.shape[-1]
+            device = position_ids.device
+            document_causal_mask = generate_doc_mask_mod(attention_mask)
+            block_mask = create_block_mask(document_causal_mask, None, None, seq_len, seq_len, device, _compile = True)
+            causal_mask = block_mask
+        else:
+            causal_mask = self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+            )
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
